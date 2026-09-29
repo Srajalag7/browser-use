@@ -41,6 +41,7 @@ from browser_use.agent.message_manager.service import (
 )
 from browser_use.agent.prompts import SystemPrompt
 from browser_use.agent.views import (
+	ActionExecutionEvent,
 	ActionResult,
 	AgentError,
 	AgentHistory,
@@ -118,6 +119,7 @@ Context = TypeVar('Context')
 
 
 AgentHookFunc = Callable[['Agent'], Awaitable[None]]
+ActionExecutionCallback = Callable[[ActionExecutionEvent, 'Agent'], Awaitable[str | None]]
 
 
 class Agent(Generic[Context, AgentStructuredOutput]):
@@ -148,6 +150,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		) = None,
 		register_external_agent_status_raise_error_callback: Callable[[], Awaitable[bool]] | None = None,
 		register_should_stop_callback: Callable[[], Awaitable[bool]] | None = None,
+		action_execution_callback: ActionExecutionCallback | None = None,
 		# Agent settings
 		output_model_schema: type[AgentStructuredOutput] | None = None,
 		use_vision: bool | Literal['auto'] = 'auto',
@@ -183,6 +186,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		_url_shortening_limit: int = 25,
 		**kwargs,
 	):
+		self.action_execution_callback = action_execution_callback
+		self.action_recording_failed = False
+		self._recorded_action_count = 0
 		if llm is None:
 			default_llm_name = CONFIG.DEFAULT_LLM
 			if default_llm_name:
@@ -1912,14 +1918,41 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 				time_start = time.time()
 
-				result = await self.tools.act(
-					action=action,
-					browser_session=self.browser_session,
-					file_system=self.file_system,
-					page_extraction_llm=self.settings.page_extraction_llm,
-					sensitive_data=self.sensitive_data,
-					available_file_paths=self.available_file_paths,
-				)
+				evidence = None
+				if self.action_execution_callback is not None:
+					self._recorded_action_count += 1
+					evidence = ActionExecutionEvent(
+						event_id=str(self._recorded_action_count),
+						step=self.state.n_steps,
+						action_index=i,
+						phase='before',
+						action=action.model_dump(exclude_unset=True),
+					)
+					await self._notify_action_execution(evidence)
+					evidence.execution_started = True
+				execution_started = time.monotonic()
+				try:
+					result = await self.tools.act(
+						action=action,
+						browser_session=self.browser_session,
+						file_system=self.file_system,
+						page_extraction_llm=self.settings.page_extraction_llm,
+						sensitive_data=self.sensitive_data,
+						available_file_paths=self.available_file_paths,
+					)
+					if evidence is not None:
+						evidence.result = result.model_dump()
+				except BaseException as action_error:
+					if evidence is not None:
+						evidence.error = type(action_error).__name__
+					raise
+				finally:
+					if evidence is not None:
+						evidence.phase = 'after'
+						evidence.duration_seconds = time.monotonic() - execution_started
+						feedback = await self._notify_action_execution(evidence)
+						if feedback and evidence.error is None:
+							result.extracted_content = (result.extracted_content or '') + '\n' + feedback
 
 				time_end = time.time()
 				time_elapsed = time_end - time_start
@@ -1935,6 +1968,18 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				raise e
 
 		return results
+
+	async def _notify_action_execution(self, event: ActionExecutionEvent) -> str | None:
+		"""Observer failures cannot stop actions; optional feedback informs the agent."""
+		if self.action_execution_callback is None:
+			return None
+		try:
+			feedback = await self.action_execution_callback(event.model_copy(deep=True), self)
+			return feedback if isinstance(feedback, str) else None
+		except Exception:
+			self.action_recording_failed = True
+			self.logger.warning('Action recording failed; this run cannot be promoted to a replay cache')
+			return None
 
 	def _log_action(self, action, action_name: str, action_num: int, total_actions: int) -> None:
 		"""Log the action before execution with colored formatting"""

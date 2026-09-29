@@ -30,6 +30,20 @@ from browser_use.tools.registry.views import ActionModel
 logger = logging.getLogger(__name__)
 
 
+class ActionExecutionEvent(BaseModel):
+	"""Evidence around one dispatched tool action, independent of its observer."""
+
+	event_id: str
+	step: int
+	action_index: int
+	phase: Literal['before', 'after']
+	action: dict[str, Any]
+	execution_started: bool = False
+	result: dict[str, Any] | None = None
+	error: str | None = None
+	duration_seconds: float = 0
+
+
 class AgentSettings(BaseModel):
 	"""Configuration options for the Agent"""
 
